@@ -61,7 +61,7 @@ def convert_to_tensor(image):
   return image
 
 
-def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, Newton_tol, positivity):
+def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, SD_steps, Newton_tol):
 
     '''
     # Arguments
@@ -107,9 +107,8 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
       )
 
       # Initialise kernel and bias (and bias correction)
-      model[0].weight = torch.nn.Parameter(1e-6*torch.ones(model[0].weight.shape, requires_grad=True))
-      model[0].bias = torch.nn.Parameter(torch.median(I).item()*torch.ones(model[0].bias.shape, requires_grad=True))
-      #model[0].bias = torch.nn.Parameter(1e1*torch.ones(model[0].bias.shape, requires_grad=True))
+      model[0].weight = torch.nn.Parameter(1e-5*torch.ones(model[0].weight.shape, requires_grad=True))
+      model[0].bias = torch.nn.Parameter(1e1*torch.ones(model[0].bias.shape, requires_grad=True))
       #offset = torch.nn.Parameter(1e-3 * torch.ones(1))
 
       #print(offset, model[0].bias)
@@ -284,6 +283,60 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
 
     coeffs = coeffs.to(device)
     #########################################################################
+    
+    def kronecker_product(t1, t2):
+        """
+        Computes the Kronecker product between two tensors.
+        See https://en.wikipedia.org/wiki/Kronecker_product
+        """
+        t1_height, t1_width = t1.size()
+        t2_height, t2_width = t2.size()
+        out_height = t1_height * t2_height
+        out_width = t1_width * t2_width
+
+        tiled_t2 = t2.repeat(t1_height, t1_width)
+        expanded_t1 = (
+            t1.unsqueeze(2)
+              .unsqueeze(3)
+              .repeat(1, t2_height, t2_width, 1)
+              .view(out_height, out_width)
+        )
+
+        return expanded_t1 * tiled_t2
+
+    # resising matrix
+    def D_nm(n, m):
+        
+        # build matrices and vectors
+        I_m = torch.eye(m)
+        I_n = torch.eye(n)
+        ones_m = torch.ones((m, 1))
+        ones_n = torch.ones((n, 1))
+        
+        # D
+        D1 = kronecker_product(I_n, ones_m.t())
+        D2 = kronecker_product(I_m, ones_n)
+        print(D1.size(), D2.size())
+        D = (D1 @ D2)/m
+        
+        return D
+        
+    # resising matrix
+    def D_nm_cuda(n, m):
+        
+        # build matrices and vectors
+        I_m = torch.eye(m, device=device)
+        I_n = torch.eye(n, device=device)
+        ones_m = torch.ones((m, 1), device=device)
+        ones_n = torch.ones((n, 1), device=device)
+        
+        # D
+        D1 = kronecker_product(I_n, ones_m.t())
+        D2 = kronecker_product(I_m, ones_n)
+        #print(D1.size(), D2.size())
+        D = (D1 @ D2)/m
+        
+        return D
 
     class negative_log_likelihood(torch.nn.Module):
         '''    
@@ -333,10 +386,37 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         #    step[g >= 0] = 1
         #    return step
 
-
         def forward(model, targ, sigma, f, gain, w, offset):
+            
+            # resize HR model to LR data image
+            # downscale model to lower resolution scene
+
+            n_original = np.int(model[0][0].size()[0])
+            n_new = np.int(n_original/1.5)
+            #print('n:%d, n_new:%d' % (n_original, n_new))
+
+            # resising matrix
+            D = D_nm_cuda(n_original, n_new)
+            
+            #print(D)
+            #print(D.size(), D.type())
+            
+            
+            #model = model.cpu()
+
+            # apply resising operation
+            model = D.t() @ model @ D
+            
+            #model = model.to(device)
+            
+            
+            #print('Re-sized model to LR')
+            #print(model.size(), targ.size())
+            
             # collapse everything to 1D
             model, targ = model.flatten(), targ.flatten()
+            #print('Collapsed everything to 1D')
+
 
             # for convenience, sort targ, and realign model so that pixel pairs correspond
             targ, indices = targ.sort()
@@ -416,15 +496,14 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
                 ])
                 
     
-    #optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=10, line_search_fn=None)
-    optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=50, line_search_fn='strong_wolfe')
-    
+    optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=10, line_search_fn=None)
+
     # L-BFGS needs to evaulte the scalar objective function multiple times each call, and requires a
     # closure to be fed to opitmizer_Newton
     def closure():
       optimizer_Newton.zero_grad()
       y_pred = model(R)
-      loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
+      loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight)
       loss.backward()
       return loss
 
@@ -445,7 +524,6 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
     ## scaled gradients ###
     #scaler = GradScaler()
     #print(torch.cuda.memory_summary(device)) 
-
     ## begin optimising ##
     print('Starting optimisation')
     for t in range(maxiter):
@@ -476,7 +554,6 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
           # Updates the scale for next iteration
           scaler.update()
           '''
-          
           if speedy is True:
             y_pred = model(R)
           else:
@@ -485,7 +562,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
           # compute the loss
           loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
 
-          if t % 100 == 0:
+          if t % 50 == 0:
             print('Iteration:%d, loss=%f, P=%f' % (t, loss.item(), torch.sum(model[0].weight).item()))
             #print(torch.sum(model[0].weight), model[0].bias, offset)
             print(model[0].bias, offset)
@@ -497,10 +574,12 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
           loss.backward()
           optimizer_Adam.step()
 
-          if positivity == True:
-              with torch.no_grad():
-                model[0].weight.clamp_(min=0)
 
+          with torch.no_grad():
+            model[0].weight.clamp_(min=0)
+            #model[0].bias.clamp_(min=0)
+
+          
           # append loss
           losses.append(loss.detach())
           ts.append(t)
@@ -509,17 +588,11 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         elif use_Newton == True and t < SD_steps_taken + 250:
           # perform a single optimisation (quasi-Newton) step
           optimizer_Newton.step(closure)
-          
-
-          if positivity == True:
-              with torch.no_grad():
-                model[0].weight.clamp_(min=0)
-
 
           # compute and append new loss after the update
           # must be a way to improve this.... #
           y_pred = model(R)
-          loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
+          loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight)
           losses.append(loss.detach())
           ts.append(t)
           
@@ -701,12 +774,12 @@ def DIA(R,
         ks = 15,
         lr_kernel = 1e-2,
         lr_B = 1e1,
+        SD_steps = 100,
         Newton_tol = 1e-6,
         poly_degree=0,
         fast=True,
         tol = 1e-5,
         max_iterations = 5000,
-        positivity = True,
         fisher=False,
         show_convergence_plots=False):
   
@@ -783,8 +856,8 @@ def DIA(R,
                                    tol = tol,
                                    lr_kernel = lr_kernel,
                                    lr_B = lr_B,
-                                   Newton_tol = Newton_tol,
-                                   positivity = positivity)
+                                   SD_steps = SD_steps,
+                                   Newton_tol = Newton_tol)
 
 
   print("--- Finished in a total of %s seconds ---" % (time.time() - start_time_total))

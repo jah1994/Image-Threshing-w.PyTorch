@@ -37,7 +37,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 from torch import autograd
-from scipy.special import i1
 
 #from torch.cuda.amp import autocast
 #from torch.cuda.amp import GradScaler
@@ -61,7 +60,7 @@ def convert_to_tensor(image):
   return image
 
 
-def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, Newton_tol, positivity):
+def infer_kernel(R, I, flat, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, SD_steps, Newton_tol):
 
     '''
     # Arguments
@@ -106,13 +105,10 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         )
       )
 
-      # Initialise kernel and bias (and bias correction)
-      model[0].weight = torch.nn.Parameter(1e-6*torch.ones(model[0].weight.shape, requires_grad=True))
-      model[0].bias = torch.nn.Parameter(torch.median(I).item()*torch.ones(model[0].bias.shape, requires_grad=True))
-      #model[0].bias = torch.nn.Parameter(1e1*torch.ones(model[0].bias.shape, requires_grad=True))
-      #offset = torch.nn.Parameter(1e-3 * torch.ones(1))
+      # Initialise kernel and bias
+      model[0].weight = torch.nn.Parameter(1e-3*torch.ones(model[0].weight.shape, requires_grad=True))
+      model[0].bias = torch.nn.Parameter(1*torch.ones(model[0].bias.shape, requires_grad=True))
 
-      #print(offset, model[0].bias)
      
     
     else:
@@ -172,231 +168,40 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         A = torch.tensor(A).float()
 
 
-      model.conv.weight = torch.nn.Parameter(1e-3 * torch.ones(model.conv.weight.shape, requires_grad=True))
-      model.poly.weight = torch.nn.Parameter(1* torch.ones(model.poly.weight.shape, requires_grad=True))
-
+      model.conv.weight = torch.nn.Parameter(1e-3* torch.ones(model.conv.weight.shape, requires_grad=True))
+      model.poly.weight = torch.nn.Parameter(1 * torch.ones(model.poly.weight.shape, requires_grad=True))
 
     # Move model to GPU
     if torch.cuda.is_available() is True:
       model = model.to(device)
-      #offset = offset.to(device).requires_grad_(True)
-      #offset = torch.ones(1).to(data.device).detach().requires_grad_(True)
-      offset = torch.cuda.FloatTensor([1.5]).requires_grad_(True)
-      print(offset.is_leaf)
-
-
-      #with torch.no_grad():
-      #  offset = offset.to(device)
-
-    # And if alpha != 0, construct the Laplacian to add as a prior
-    # to penalize the log-likelihood
-    alpha = 0
-    if alpha != 0.:
-        Nk = model[0].weight[0][0].flatten().size()[0]# number of DBFs
-        print('Constructing Laplacian for square kernel with %d DBFs' % Nk)
-        
-        L = np.zeros((Nk, Nk))
-        
-        centre_bit = np.arange(1, np.sqrt(Nk)-1)
-        
-        # corners
-        L[0][0] = 2
-        L[-1][-1] = 2
-        L[np.int(np.sqrt(Nk)-1)][np.int(np.sqrt(Nk)-1)] = 2
-        L[Nk-np.int(np.sqrt(Nk))][Nk-np.int(np.sqrt(Nk))] = 2
-        
-        for u in range(0, Nk):
-            for v in range(0, Nk):
-                # diagonals
-                if u == v:
-                    # centre bit
-                    if np.sqrt(Nk) < u < Nk - np.sqrt(Nk) - 1 and u % np.sqrt(Nk) in centre_bit:
-                        L[u][v] = 4
-                    
-                    # rest of diags are 3
-                    elif L[u][v] != 2:
-                        L[u][v] = 3
-                
-                # off-diagonals        
-                elif u != v:
-                    if u == v+1:
-                        if (v+1) % np.sqrt(Nk) != 0:
-                            L[u][v] = -1
-                            L[v][u] = -1
-                            
-                    elif u == v + np.sqrt(Nk):
-                        L[u][v] = -1
-                        L[v][u] = -1
-    
-    
-        # convert L to tensor
-        L = torch.from_numpy(L).float()
-        # move L to cuda
-        if torch.cuda.is_available() is True:
-            L = L.to(device)
-            
-    # target image pixels
-    N_dat = I[0][0].flatten().size()[0]
 
     # Define the loss (our scalar objective function to optimise)
     # Sometimes referred to as the 'cost' in the ML literature
-    #sigma0 = 5 # CCD read noise. G=1, F_ij = 1
-    sigma, f, gain = 60., 25.8, 300.
-    
-    ##################################################################################################
-    ## as implemented in Salahat et al. 2013 for approximating the modified Bessel function of the first kind
-    def I1_vectorised(argument, coeffs):
-    
-            z0 = argument[argument >= 0]
-            z0 = z0[z0 <= 11.5]
-            z0 = z0.reshape(len(z0), 1)
-        
-            z1 = argument[argument > 11.5]
-            z1 = z1[z1 <= 20]
-            z1 = z1.reshape(len(z1), 1)
-        
-            z2 = argument[argument > 20]
-            z2 = z2[z2 <= 37.25]
-            z2 = z2.reshape(len(z2), 1)
-        
-            z3 = argument[argument > 37.25]
-            z3 = z3.reshape(len(z3), 1)
-        
-            a0, a1, a2, a3 = coeffs[:,0], coeffs[:,2], coeffs[:, 4], coeffs[:,6]
-            b0, b1, b2, b3 = coeffs[:,1], coeffs[:,3], coeffs[:, 5], coeffs[:,7]
-        
-            def linalg(z, a, b):
-                expz = torch.exp(z @ b.reshape(1, len(b)))
-                ab = a*b
-                out = expz @ ab
-                return out
-        
-            out0, out1, out2, out3 = linalg(z0, a0, b0), linalg(z1, a1, b1), linalg(z2, a2, b2), linalg(z3, a3, b3)
-        
-            out = torch.cat((out0, out1, out2, out3))
-        
-            return out
-
-    coeffs = torch.Tensor([[0.1682, 0.7536, 0.2667, 0.4710, 0.1121, 0.9807, 2.41e-9, 1.144],
-                       [0.1472, 0.9739, 0.4916, -163.40, 0.1055, 0.8672, 0.06745, 0.995],
-                       [0.4450, -0.715, 0.1110, 0.9852, -0.00018, 1.0795, 0.05471, 0.5686],
-                       [0.2382, 0.2343, 0.1304, 0.8554, 0.00326, 1.0385, 0.07869, 0.946]])
-
-    coeffs = coeffs.to(device)
-    #########################################################################
-
     class negative_log_likelihood(torch.nn.Module):
-        '''    
-        def forward(model, targ, r, f, g):
-            ## for convenience, flatten the model and target images and sort by ascending pixel value
-            model, targ = model.flatten().sort()[0], targ.flatten().sort()[0]
-            pi = torch.from_numpy(np.array(np.pi))
-            lam = (f/g)*model
-            prob = (1./torch.sqrt(2*pi*r**2)) * torch.exp(-lam - ((f*targ)**2/(2*r**2)))
-            ## EM amplification
-            targ_pos = targ[targ > 0]
-            model_pos = model[targ > 0]
-            lam_pos = lam[targ > 0]
-            xs = 2*torch.sqrt((f*targ_pos*lam_pos)/g)
-            print('xs:', xs)
-            print('Maximum z to evaluate for I_1(z):', torch.max(xs))
-            print('Minimum z to evaluate for I_1(z):', torch.min(xs))
-            bessel = I1_vectorised(xs, coeffs)
-            print(bessel.size())
-            prob_EM = torch.sqrt(lam_pos/(f*targ_pos*g)) * torch.exp(-lam_pos - ((f*targ_pos)/g)) * bessel
-            
-            ## add EM amplifiation bit to full pdf
-            prob_pos = prob[targ > 0.] + prob_EM
-            prob_else = prob[targ <= 0.]
-            prob_full = torch.cat((prob_else, prob_pos))
-            prob_full = f*prob_full
+    
+        def forward(model, targ, flat):
+            #var = model + sigma0**2
+            #chi2 = torch.sum((model - targ) ** 2 / var)
+            #ln_sigma = torch.sum(torch.log(var))
+            #nll = 0.5 * (chi2 + ln_sigma)
 
-            #print(prob_full)
-            
-            #ll = torch.prod(prob_full)
-            ll = torch.sum(torch.log(prob_full))
-            nll = -ll
+            # Total gain, G, and EMCCD excess noise factor, E
+            G = 25.8/300.
+            E = 2
 
-            print('nll:', nll)
+            read_noise = 2.33/flat # ADU
+            shot_noise = model/(G*flat)
+            var = torch.clamp(E*shot_noise, min=0) + read_noise**2
+           
+            chi2 = torch.sum((model - targ) ** 2 / var)
+            ln_sigma = torch.sum(torch.log(var))
+            nll = 0.5 * (chi2 + ln_sigma)
 
             return nll
-        '''
-        # g (e-_EM), electrons generated after the EM amplification
-        # n (e-_phot), electron generated before the EM amplification
-        # sigma (e-_EM), the standard deviation of the readnoise
-        # gain (e-_EM / e-_phot), EM amplification gain
-        # f (e-_EM / ADU)
-        # counts (ADU) i.e. image pixel values
 
-        #def Heaviside(g):
-        #    step = np.zeros(g.shape)
-        #    step[g >= 0] = 1
-        #    return step
-
-
-        def forward(model, targ, sigma, f, gain, w, offset):
-            # collapse everything to 1D
-            model, targ = model.flatten(), targ.flatten()
-
-            # for convenience, sort targ, and realign model so that pixel pairs correspond
-            targ, indices = targ.sort()
-            model = model[indices]
-            #print('targ', torch.min(targ), torch.max(targ))
-            #print('model', torch.min(model), torch.max(model))
-            # define 'pi' as a tensor
-            pi = torch.from_numpy(np.array(np.pi))
-            # convert ADU counts to appropriate dimensions
-            g = f*(targ - offset) # (e-_EM / ADU) * ADU = e-_EM
-            n = (f/gain)*model # (e-_EM / ADU) * (e-_phot / e_EM) * ADU = e-_phot
-
-            #print('g', torch.min(g), torch.max(g))
-            #print('n', torch.min(n), torch.max(n))
-
-            ##### gaussian read noise #####
-            #pdf_readout = torch.clamp(torch.exp(-n) * (1./torch.sqrt(2*pi*sigma**2)) * torch.exp(-0.5*(g/sigma)**2), min=1e-30, max=1e30)
-            pdf_readout = torch.exp(-n) * (1./torch.sqrt(2*pi*sigma**2)) * torch.exp(-0.5*(g/sigma)**2)
-            #print('readout:', torch.min(pdf_readout), torch.max(pdf_readout))
-            #print(pdf_readout)
-
-            ##### EM gain noise #####
-            # only defined for g>0
-            g_pos = g[g>0]
-            n_pos = n[g>0]
-
-            # require n_pos > 0
-            n_pos = torch.clamp(n_pos, min=1e-30)
-
-            # evaluate modified bessel function of first order
-            x = 2*torch.sqrt((n_pos*g_pos)/gain)
-            bessel = I1_vectorised(x, coeffs)
-
-            # EM pdf
-            pdf_EM = torch.exp(-n_pos - (g_pos/gain)) * torch.sqrt(n_pos/(g_pos*gain)) * bessel
-            #print('EM:', torch.min(pdf_EM), torch.max(pdf_EM))
-
-            # add EM pdf to readout pdf for g>0 pixels
-            pdf_pos = pdf_readout[g > 0] + pdf_EM
-            pdf_neg = pdf_readout[g <= 0]
-
-            # plug everything back together and compute the log-likelihood
-            pdf = f*torch.cat((pdf_neg, pdf_pos)) # convert to 1/ADU = (e-_EM/ADU) * (1/e-_EM)
-            #pdf = torch.clamp(pdf, min=1e-30)
-            #print(torch.min(pdf), torch.max(pdf))
-
-            ll = torch.sum(torch.log(pdf))
-
-            # add laplacian prior on kernel pixels
-            if alpha != 0.:
-                vector = w[0][0].flatten()
-                prior = -alpha * N_dat * (vector.t() @ L.t() @ L @ vector)
-                ll += prior
-
-            return -ll
-    
     # Keep track of the speed to convergence for development's sake
     losses = []
     ts = []
-
 
     # prepare optimizers - For (steepest) gradient descent, we use Adam
     # and once we get close to the minimum, we switch to L-BFGS
@@ -404,8 +209,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
 
       optimizer_Adam = torch.optim.Adam([
                       {'params': model[0].weight, 'lr': lr_kernel},
-                      {'params': model[0].bias, 'lr': lr_B},
-                      {'params': offset, 'lr': 1e-3}
+                      {'params': model[0].bias, 'lr': lr_B}
                   ])
                   
     else:
@@ -416,15 +220,14 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
                 ])
                 
     
-    #optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=10, line_search_fn=None)
-    optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=50, line_search_fn='strong_wolfe')
-    
+    optimizer_Newton = torch.optim.LBFGS(model.parameters(), tolerance_change=tol, history_size=10, line_search_fn=None)
+
     # L-BFGS needs to evaulte the scalar objective function multiple times each call, and requires a
     # closure to be fed to opitmizer_Newton
     def closure():
       optimizer_Newton.zero_grad()
       y_pred = model(R)
-      loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
+      loss = negative_log_likelihood.forward(y_pred, I, flat)
       loss.backward()
       return loss
 
@@ -444,12 +247,10 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
     
     ## scaled gradients ###
     #scaler = GradScaler()
-    #print(torch.cuda.memory_summary(device)) 
 
     ## begin optimising ##
     print('Starting optimisation')
     for t in range(maxiter):
-
 
         # flag to use steepest decent if relative change in loss
         # not below Newton_tol
@@ -469,38 +270,27 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
               y_pred = model(R, A)
       
           # compute the loss
-          loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain)
+          loss = negative_log_likelihood.forward(y_pred, I)
 
           scaler.scale(loss).backward()
           scaler.step(optimizer_Adam)
           # Updates the scale for next iteration
           scaler.update()
           '''
-          
           if speedy is True:
             y_pred = model(R)
           else:
             y_pred = model(R, A)
       
           # compute the loss
-          loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
-
-          if t % 100 == 0:
-            print('Iteration:%d, loss=%f, P=%f' % (t, loss.item(), torch.sum(model[0].weight).item()))
-            #print(torch.sum(model[0].weight), model[0].bias, offset)
-            print(model[0].bias, offset)
-          #print(loss.item(), torch.sum(model[0].weight).item(), model[0].bias.item(), offset.item())
+          loss = negative_log_likelihood.forward(y_pred, I, flat)
          
           # clear gradients, compute gradients, take a single
           # steepest descent step
           optimizer_Adam.zero_grad()
           loss.backward()
           optimizer_Adam.step()
-
-          if positivity == True:
-              with torch.no_grad():
-                model[0].weight.clamp_(min=0)
-
+          
           # append loss
           losses.append(loss.detach())
           ts.append(t)
@@ -509,17 +299,11 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         elif use_Newton == True and t < SD_steps_taken + 250:
           # perform a single optimisation (quasi-Newton) step
           optimizer_Newton.step(closure)
-          
-
-          if positivity == True:
-              with torch.no_grad():
-                model[0].weight.clamp_(min=0)
-
 
           # compute and append new loss after the update
           # must be a way to improve this.... #
           y_pred = model(R)
-          loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain, model[0].weight, offset)
+          loss = negative_log_likelihood.forward(y_pred, I, flat)
           losses.append(loss.detach())
           ts.append(t)
           
@@ -531,7 +315,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         # Convergence reached if less than specified tol and more than 100
         # steps taken (guard against early stopping)
         if speedy is True:
-          if t>100 and abs((losses[-1] - losses[-2])/losses[-2]) < tol:
+          if t>300 and abs((losses[-1] - losses[-2])/losses[-2]) < tol:
             print('Converged!')
             print('Total steps taken:', t)
             try:
@@ -541,7 +325,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
                 print('SD only')
             break
 
-          elif t>100 and abs((losses[-1] - losses[-2])/losses[-2]) < Newton_tol and use_Newton == False:
+          elif t>250 and abs((losses[-1] - losses[-2])/losses[-2]) < Newton_tol and use_Newton == False:
             use_Newton = True
             SD_steps_taken = t
             print('Switching to Quasi-Newton step after %d SD steps' % SD_steps_taken)
@@ -644,7 +428,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
         y_pred = model(R)
       else:
         y_pred = model(R, A)
-      loss = negative_log_likelihood.forward(y_pred, I, sigma, f, gain)
+      loss = negative_log_likelihood.forward(y_pred, I, flat)
       logloss_grads = autograd.grad(loss, model.parameters(), create_graph=True, retain_graph=True)
       print('Building full Hessian...')
       full_hessian_time = time.time() 
@@ -677,9 +461,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
     
 
     # flip kernel to correct orientation (as I pass this to conv2d)
-    print('Not flipping kernel, as passed to torch.functional.conv2d')
-    flipped_kernel = torch.flip(kernel, [2, 3])
-    flipped_kernel = flipped_kernel[0][0].cpu().detach().numpy()
+    kernel = torch.flip(kernel, [2, 3])
     kernel = kernel[0][0].cpu().detach().numpy()
     B = B[0].cpu().detach().numpy()
 
@@ -690,7 +472,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
       X, Y = np.meshgrid(x, y, copy=False)
       B = poly2Dreco(X, Y, B)
     
-    return kernel, B, offset.cpu().detach().numpy(), flipped_kernel
+    return kernel, B
 
 
 
@@ -701,12 +483,12 @@ def DIA(R,
         ks = 15,
         lr_kernel = 1e-2,
         lr_B = 1e1,
+        SD_steps = 100,
         Newton_tol = 1e-6,
         poly_degree=0,
         fast=True,
         tol = 1e-5,
         max_iterations = 5000,
-        positivity = True,
         fisher=False,
         show_convergence_plots=False):
   
@@ -759,7 +541,7 @@ def DIA(R,
   start_time_total = time.time()
     
   #### Convert numpy images to tensors and move to GPU
-  I, R = convert_to_tensor(I), convert_to_tensor(R)
+  I, R, flat = convert_to_tensor(I), convert_to_tensor(R), convert_to_tensor(flat)
 
   time_to_move_to_GPU = time.time()
     
@@ -767,29 +549,31 @@ def DIA(R,
   if torch.cuda.is_available() is True:
     R = R.to(device)
     I = I.to(device)
+    flat = flat.to(device)
+   
 
 
   print("--- Time to move data onto GPU: %s ---" % (time.time() - time_to_move_to_GPU))
 
 
 
-  kernel, B, offset, flipped_kernel = infer_kernel(R, I, 
-                                   maxiter=max_iterations,
-                                   FIM=fisher,
-                                   convergence_plots=show_convergence_plots,
-                                   d = poly_degree,
-                                   ks = ks,
-                                   speedy = fast,
-                                   tol = tol,
-                                   lr_kernel = lr_kernel,
-                                   lr_B = lr_B,
-                                   Newton_tol = Newton_tol,
-                                   positivity = positivity)
+  kernel, B = infer_kernel(R, I, flat, 
+				   maxiter=max_iterations,
+				   FIM=fisher,
+				   convergence_plots=show_convergence_plots,
+				   d = poly_degree,
+				   ks = ks,
+				   speedy = fast,
+				   tol = tol,
+				   lr_kernel = lr_kernel,
+				   lr_B = lr_B,
+				   SD_steps = SD_steps,
+				   Newton_tol = Newton_tol)
 
 
   print("--- Finished in a total of %s seconds ---" % (time.time() - start_time_total))
 
-  return kernel, B, offset.item(), flipped_kernel
+  return kernel, B
 
 
 
