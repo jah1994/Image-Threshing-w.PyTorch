@@ -61,7 +61,7 @@ def convert_to_tensor(image):
   return image
 
 
-def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, Newton_tol, positivity):
+def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_kernel, lr_B, Newton_tol, positivity, phi):
 
     '''
     # Arguments
@@ -386,9 +386,14 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
             ll = torch.sum(torch.log(pdf))
 
             # add laplacian prior on kernel pixels
-            if alpha != 0.:
+            #if alpha != 0.:
+            #    vector = w[0][0].flatten()
+            #    prior = -alpha * N_dat * (vector.t() @ L.t() @ L @ vector)
+            #    ll += prior
+            
+            if phi != 0.:
                 vector = w[0][0].flatten()
-                prior = -alpha * N_dat * (vector.t() @ L.t() @ L @ vector)
+                prior = -phi * torch.sum(torch.abs(vector))
                 ll += prior
 
             return -ll
@@ -494,6 +499,7 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
           # clear gradients, compute gradients, take a single
           # steepest descent step
           optimizer_Adam.zero_grad()
+          #loss.backward(retain_graph=True)
           loss.backward()
           optimizer_Adam.step()
 
@@ -539,6 +545,9 @@ def infer_kernel(R, I, maxiter, FIM, convergence_plots, d, ks, speedy, tol, lr_k
               print('L-BFGS steps:', t - SD_steps_taken)
             except UnboundLocalError:
                 print('SD only')
+            break
+            
+          elif torch.isnan(losses[-1]) == True:
             break
 
           elif t>100 and abs((losses[-1] - losses[-2])/losses[-2]) < Newton_tol and use_Newton == False:
@@ -707,6 +716,7 @@ def DIA(R,
         tol = 1e-5,
         max_iterations = 5000,
         positivity = True,
+        phi = 0,
         fisher=False,
         show_convergence_plots=False):
   
@@ -784,7 +794,8 @@ def DIA(R,
                                    lr_kernel = lr_kernel,
                                    lr_B = lr_B,
                                    Newton_tol = Newton_tol,
-                                   positivity = positivity)
+                                   positivity = positivity,
+                                   phi = phi)
 
 
   print("--- Finished in a total of %s seconds ---" % (time.time() - start_time_total))
